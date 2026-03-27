@@ -1,0 +1,179 @@
+name: Azure Delivery
+
+on:
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      ref:
+        description: Git ref to deploy
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+env:
+  IMAGE_NAME: neuro-san-studio
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+      git_ref: ${{ steps.resolve.outputs.git_ref }}
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+
+    steps:
+      - name: Resolve target environment and image tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TARGET_ENV="prod"
+            GIT_REF="${{ github.event.release.tag_name }}"
+            IMAGE_TAG="${{ github.event.release.tag_name }}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TARGET_ENV="${{ inputs.environment }}"
+            GIT_REF="${{ inputs.ref || github.ref_name }}"
+            IMAGE_TAG="${{ github.sha }}"
+          else
+            TARGET_ENV="dev"
+            GIT_REF="${{ github.ref_name }}"
+            IMAGE_TAG="${{ github.sha }}"
+          fi
+
+          echo "environment=${TARGET_ENV}" >> "$GITHUB_OUTPUT"
+          echo "git_ref=${GIT_REF}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: resolve
+    outputs:
+      image_reference: ${{ steps.image.outputs.image_reference }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.git_ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image using repo build logic
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_IMAGE="neuro-san/${IMAGE_NAME}:${{ needs.resolve.outputs.image_tag }}"
+          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}:${{ needs.resolve.outputs.image_tag }}"
+
+          SERVICE_VERSION="${{ needs.resolve.outputs.image_tag }}" \
+          TARGET_PLATFORM="linux/amd64" \
+          ./deploy/build.sh
+
+          docker tag "$SOURCE_IMAGE" "$GHCR_IMAGE"
+          docker push "$GHCR_IMAGE"
+
+          echo "image_reference=$GHCR_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Add environment alias tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_REPOSITORY="ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}"
+          SOURCE_IMAGE="${IMAGE_REPOSITORY}:${{ needs.resolve.outputs.image_tag }}"
+
+          docker tag \
+            "$SOURCE_IMAGE" \
+            "${IMAGE_REPOSITORY}:${{ needs.resolve.outputs.environment }}-latest"
+          docker push "${IMAGE_REPOSITORY}:${{ needs.resolve.outputs.environment }}-latest"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs:
+      - resolve
+      - build
+    environment: ${{ needs.resolve.outputs.environment }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra/tofu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.git_ref }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: latest
+
+      - name: OpenTofu init
+        run: |
+          tofu init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${{ needs.resolve.outputs.environment }}/neuro-san.tfstate" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: OpenTofu fmt check
+        run: tofu fmt -check -recursive
+
+      - name: OpenTofu validate
+        run: tofu validate
+
+      - name: OpenTofu plan
+        env:
+          TF_VAR_location: ${{ vars.AZURE_LOCATION }}
+          TF_VAR_name_prefix: ${{ vars.NAME_PREFIX }}
+          TF_VAR_github_owner: ${{ github.repository_owner }}
+          TF_VAR_image_name: ${{ env.IMAGE_NAME }}
+          TF_VAR_image_tag: ${{ needs.resolve.outputs.image_tag }}
+          TF_VAR_ghcr_username: ${{ vars.GHCR_USERNAME }}
+          TF_VAR_ghcr_token: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          tofu plan \
+            -var-file="environments/${{ needs.resolve.outputs.environment }}.tfvars" \
+            -out=tfplan
+
+      - name: OpenTofu apply
+        run: tofu apply -auto-approve tfplan
+
+      - name: Show deployment outputs
+        run: tofu output
