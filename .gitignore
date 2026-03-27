@@ -203,3 +203,10 @@ registries/generated/
 
 # test local only
 registries/manifest.hocon.test
+
+# OpenTofu/Terraform local state
+infra/tofu/.terraform/
+infra/tofu/*.tfstate
+infra/tofu/*.tfstate.*
+infra/tofu/tfplan
+infra/tofu/.terraform.lock.hcl
